@@ -1,1 +1,0 @@
-## Taxi Cab Classification
