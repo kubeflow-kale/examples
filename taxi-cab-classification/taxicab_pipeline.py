@@ -278,34 +278,32 @@ def run_transform(output_dir, schema, train_data_file, eval_data_file, preproces
                 coder=ExampleProtoCoder(transformed_metadata.schema))
 
 
-# TRAIN_DATA = 'taxi-cab-classification/train.csv'
-# EVALUATION_DATA = 'taxi-cab-classification/eval.csv'
-#
-# if os.path.exists(os.path.join(DATA_DIR, "transformed")):
-#     shutil.rmtree(os.path.join(DATA_DIR, "transformed"))
-#
-# logging.getLogger().setLevel(logging.INFO)
-# schema = json.loads(file_io.read_file_to_string(os.path.join(DATA_DIR, "taxi-cab-classification/schema.json")))
-#
-#
-# def wrapped_preprocessing_fn(inputs):
-#     outputs = preprocess(inputs)
-#     for key in outputs:
-#         if outputs[key].dtype == tf.bool:
-#             outputs[key] = tft.compute_and_apply_vocabulary(tf.as_string(outputs[key]),
-#                                              vocab_filename='vocab_' + key)
-#     return outputs
-#
-#
-# preprocessing_fn = wrapped_preprocessing_fn
-#
-# run_transform(os.path.join(DATA_DIR, "transformed"),
-#               schema,
-#               DATA_DIR + TRAIN_DATA,
-#               DATA_DIR + EVALUATION_DATA,
-#               preprocessing_fn=preprocessing_fn)
+TRAIN_DATA = 'taxi-cab-classification/train.csv'
+EVALUATION_DATA = 'taxi-cab-classification/eval.csv'
+
+if os.path.exists(os.path.join(DATA_DIR, "transformed")):
+    shutil.rmtree(os.path.join(DATA_DIR, "transformed"))
+
+logging.getLogger().setLevel(logging.INFO)
+schema = json.loads(file_io.read_file_to_string(os.path.join(DATA_DIR, "taxi-cab-classification/schema.json")))
 
 
+def wrapped_preprocessing_fn(inputs):
+    outputs = preprocess(inputs)
+    for key in outputs:
+        if outputs[key].dtype == tf.bool:
+            outputs[key] = tft.compute_and_apply_vocabulary(tf.as_string(outputs[key]),
+                                             vocab_filename='vocab_' + key)
+    return outputs
+
+
+preprocessing_fn = wrapped_preprocessing_fn
+
+run_transform(os.path.join(DATA_DIR, "transformed"),
+              schema,
+              DATA_DIR + TRAIN_DATA,
+              DATA_DIR + EVALUATION_DATA,
+              preprocessing_fn=preprocessing_fn)
 
 
 #  ------------------------------------------------------------------------------------------------
@@ -439,11 +437,10 @@ def get_estimator(transformed_output, target_name, output_dir, hidden_units,
     return estimator
 
 
-def eval_input_receiver_fn(transformed_output, target):
+def eval_input_receiver_fn(transformed_output):
     """Build everything needed for the tf-model-analysis to run the model.
     Args:
       transformed_output: tft.TFTransformOutput
-      target: name of the target column.
     Returns:
       EvalInputReceiver function, which contains:
         - Tensorflow graph which parses raw untranformed features, applies the
@@ -453,13 +450,13 @@ def eval_input_receiver_fn(transformed_output, target):
     """
     serialized_tf_example = tf.compat.v1.placeholder(
         dtype=tf.string, shape=[None], name='input_example_tensor')
-    features = tf.io.parse_example(serialized_tf_example, transformed_output.transformed_feature_spec())
+    features = tf.io.parse_example(serialized_tf_example, transformed_output.raw_feature_spec())
     transformed_features = transformed_output.transform_raw_features(features)
     receiver_tensors = {'examples': serialized_tf_example}
     return tfma.export.EvalInputReceiver(
         features=transformed_features,
         receiver_tensors=receiver_tensors,
-        labels=transformed_features[target])
+        labels=transformed_features[LABEL_KEY])
 
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
@@ -493,8 +490,7 @@ eval_model_dir = os.path.join(DATA_DIR + "training", 'tfma_eval_model_dir')
 tfma.export.export_eval_savedmodel(
     estimator=estimator,
     export_dir_base=eval_model_dir,
-    eval_input_receiver_fn=(
-        lambda: eval_input_receiver_fn(tf_transform_output, "tips")))
+    eval_input_receiver_fn=(lambda: eval_input_receiver_fn(tf_transform_output)))
 
 metadata = {
     'outputs': [{
