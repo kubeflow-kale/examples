@@ -189,10 +189,8 @@ def preprocess(inputs):
     return outputs
 
 
-def get_feature_columns(transformed_data_dir):
+def get_feature_columns():
     """Callback that returns a list of feature columns for building a tf.estimator.
-    Args:
-      transformed_data_dir: The GCS directory holding the output of the tft transformation.
     Returns:
       A list of tf.feature_column.
     """
@@ -211,7 +209,6 @@ def get_feature_columns(transformed_data_dir):
                     key, num_buckets=num_buckets, default_value=0))
                 for key, num_buckets in zip(CATEGORICAL_FEATURE_KEYS, MAX_CATEGORICAL_FEATURE_VALUES)])
 
-
 #  ------------------------------------------------------------------------------------------------
 #                                    DATA VALIDATION OP
 #  ------------------------------------------------------------------------------------------------
@@ -222,13 +219,6 @@ def get_feature_columns(transformed_data_dir):
 #  ------------------------------------------------------------------------------------------------
 #                                    TRANSFORM OP
 #  ------------------------------------------------------------------------------------------------
-
-
-# Inception Checkpoint
-INCEPTION_V3_CHECKPOINT = 'gs://cloud-ml-data/img/flower_photos/inception_v3_2016_08_28.ckpt'
-INCEPTION_EXCLUDED_VARIABLES = ['InceptionV3/AuxLogits', 'InceptionV3/Logits', 'global_step']
-
-DELIMITERS = '.,!?() '
 
 
 def run_transform(output_dir, schema, train_data_file, eval_data_file, preprocessing_fn=None):
@@ -322,114 +312,115 @@ def run_transform(output_dir, schema, train_data_file, eval_data_file, preproces
 #                                    TRAIN OP
 #  ------------------------------------------------------------------------------------------------
 
-
 LEARNING_RATE = 0.1
 HIDDEN_LAYER_SIZE = '1500'
 STEPS = 3
+BATCH_SIZE = 32
+EPOCHS = 1
 CLASSIFICATION_TARGET_TYPES = [tf.bool, tf.int32, tf.int64]
 REGRESSION_TARGET_TYPES = [tf.float32, tf.float64]
 TARGET_TYPES = CLASSIFICATION_TARGET_TYPES + REGRESSION_TARGET_TYPES
 
 
-def is_classification(transformed_data_dir, target):
+def is_classification(transformed_output, target):
     """Whether the scenario is classification (vs regression).
 
     Returns:
       The number of classes if the target represents a classification
       problem, or None if it does not.
     """
-    transformed_metadata = metadata_io.read_metadata(
-        os.path.join(transformed_data_dir, transform_fn_io.TRANSFORMED_METADATA_DIR))
-    transformed_feature_spec = tft.tf_metadata.schema_utils.schema_as_feature_spec(transformed_metadata.schema)[0]
-    if target not in transformed_feature_spec:
+    if target not in transformed_output.transformed_feature_spec():
         raise ValueError('Cannot find target "%s" in transformed data.' % target)
 
-    feature = transformed_feature_spec[target]
-    if (not isinstance(feature, tf.FixedLenFeature) or feature.shape != [] or
+    feature = transformed_output.transformed_feature_spec()[target]
+    if (not isinstance(feature, tf.io.FixedLenFeature) or feature.shape != [] or
             feature.dtype not in TARGET_TYPES):
         raise ValueError('target "%s" is of invalid type.' % target)
 
     if feature.dtype in CLASSIFICATION_TARGET_TYPES:
         if feature.dtype == tf.bool:
             return 2
-        return get_vocab_size(transformed_data_dir, target)
+        return transformed_output.vocabulary_size_by_name("vocab_" + target)
 
     return None
 
 
-def make_training_input_fn(transformed_data_dir, mode, batch_size, target_name, num_epochs=None):
+def make_training_input_fn(transformed_output, transformed_examples, batch_size, target_name):
     """Creates an input function reading from transformed data.
     Args:
-      transformed_data_dir: Directory to read transformed data and metadata from.
-      mode: 'train' or 'eval'.
+      transformed_output: tft.TFTransformOutput
+      transformed_examples: Base filename of examples
       batch_size: Batch size.
       target_name: name of the target column.
-      num_epochs: number of training data epochs.
     Returns:
       The input function for training or eval.
     """
-    transformed_metadata = metadata_io.read_metadata(
-        os.path.join(transformed_data_dir, transform_fn_io.TRANSFORMED_METADATA_DIR))
-    transformed_feature_spec = transformed_metadata.schema.as_feature_spec()
-
     def _input_fn():
         """Input function for training and eval."""
-        epochs = 1 if mode == 'eval' else num_epochs
-        transformed_features = tf.contrib.learn.io.read_batch_features(
-            os.path.join(transformed_data_dir, mode + '-*'),
-            batch_size, transformed_feature_spec, tf.TFRecordReader, num_epochs=epochs)
+        dataset = tf.data.experimental.make_batched_features_dataset(
+            file_pattern=transformed_examples,
+            batch_size=batch_size,
+            features=transformed_output.transformed_feature_spec(),
+            reader=tf.data.TFRecordDataset,
+            shuffle=True)
+
+        transformed_features = dataset.make_one_shot_iterator().get_next()
 
         # Extract features and label from the transformed tensors.
         transformed_labels = transformed_features.pop(target_name)
+
         return transformed_features, transformed_labels
 
     return _input_fn
 
 
-def make_serving_input_fn(transformed_data_dir, schema, target_name):
+def make_serving_input_fn(transformed_output):
     """Creates an input function reading from transformed data.
     Args:
-      transformed_data_dir: Directory to read transformed data and metadata from.
-      schema: the raw data schema.
-      target_name: name of the target column.
+      transformed_output: tft.TFTransformOutput
     Returns:
       The input function for serving.
     """
-    raw_metadata = make_tft_input_metadata(schema)
-    raw_feature_spec = raw_metadata.schema.as_feature_spec()
+    raw_feature_spec = transformed_output.raw_feature_spec()
+    # Remove label since it is not available during serving.
+    raw_feature_spec.pop(LABEL_KEY)
 
-    raw_keys = [x['name'] for x in schema]
-    raw_keys.remove(target_name)
-    serving_input_fn = input_fn_maker.build_csv_transforming_serving_input_receiver_fn(
-        raw_metadata=raw_metadata,
-        transform_savedmodel_dir=transformed_data_dir + '/transform_fn',
-        raw_keys=raw_keys)
+    def _serving_input_fn():
+        """Input function for serving."""
+        # Get raw features by generating the basic serving input_fn and calling it.
+        # Here we generate an input_fn that expects a parsed Example proto to be fed
+        # to the model at serving time.  See also
+        # tf.estimator.export.build_raw_serving_input_receiver_fn.
+        raw_input_fn = tf.estimator.export.build_parsing_serving_input_receiver_fn(
+            raw_feature_spec, default_batch_size=None)
+        serving_input_receiver = raw_input_fn()
 
-    return serving_input_fn
+        # Apply the transform function that was used to generate the materialized data.
+        raw_features = serving_input_receiver.features
+        transformed_features = tf_transform_output.transform_raw_features(
+            raw_features)
+
+        return tf.estimator.export.ServingInputReceiver(
+            transformed_features, serving_input_receiver.receiver_tensors)
+
+    return _serving_input_fn
 
 
-def get_vocab_size(transformed_data_dir, feature_name):
-    """Get vocab size of a given text or category column."""
-    vocab_file = os.path.join(transformed_data_dir,
-                              transform_fn_io.TRANSFORM_FN_DIR,
-                              'assets',
-                              'vocab_' + feature_name)
-    with file_io.FileIO(vocab_file, 'r') as f:
-        return sum(1 for _ in f)
-
-
-def get_estimator(schema, transformed_data_dir, target_name, output_dir, hidden_units,
+def get_estimator(transformed_output, target_name, output_dir, hidden_units,
                   optimizer, learning_rate, feature_columns):
     """Get proper tf.estimator (DNNClassifier or DNNRegressor)."""
-    optimizer = tf.train.AdagradOptimizer(learning_rate)
     if optimizer == 'Adam':
-        optimizer = tf.train.AdamOptimizer(learning_rate)
+        optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
     elif optimizer == 'SGD':
-        optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+        optimizer = tf.compat.v1.train.GradientDescentOptimizer(learning_rate)
+    elif optimizer == 'Adagrad':
+        optimizer = tf.compat.v1.train.AdagradOptimizer(learning_rate)
+    else:
+        raise ValueError(f"Optimizer value not recognized: {optimizer}")
 
     # Set how often to run checkpointing in terms of steps.
-    config = tf.contrib.learn.RunConfig(save_checkpoints_steps=1000)
-    n_classes = is_classification(transformed_data_dir, target_name)
+    config = tf.estimator.RunConfig(save_checkpoints_steps=1000)
+    n_classes = is_classification(transformed_output, target_name)
     if n_classes:
         estimator = tf.estimator.DNNClassifier(
             feature_columns=feature_columns,
@@ -448,12 +439,10 @@ def get_estimator(schema, transformed_data_dir, target_name, output_dir, hidden_
     return estimator
 
 
-def eval_input_receiver_fn(tf_transform_dir, schema, target):
+def eval_input_receiver_fn(transformed_output, target):
     """Build everything needed for the tf-model-analysis to run the model.
     Args:
-      tf_transform_dir: directory in which the tf-transform model was written
-        during the preprocessing step.
-      schema: the raw data schema.
+      transformed_output: tft.TFTransformOutput
       target: name of the target column.
     Returns:
       EvalInputReceiver function, which contains:
@@ -462,15 +451,10 @@ def eval_input_receiver_fn(tf_transform_dir, schema, target):
         - Set of raw, untransformed features.
         - Label against which predictions will be compared.
     """
-    raw_metadata = make_tft_input_metadata(schema)
-    raw_feature_spec = raw_metadata.schema.as_feature_spec()
-    serialized_tf_example = tf.placeholder(
+    serialized_tf_example = tf.compat.v1.placeholder(
         dtype=tf.string, shape=[None], name='input_example_tensor')
-    features = tf.parse_example(serialized_tf_example, raw_feature_spec)
-    _, transformed_features = (
-        saved_transform_io.partially_apply_saved_transform(
-            os.path.join(tf_transform_dir, transform_fn_io.TRANSFORM_FN_DIR),
-            features))
+    features = tf.io.parse_example(serialized_tf_example, transformed_output.transformed_feature_spec())
+    transformed_features = transformed_output.transform_raw_features(features)
     receiver_tensors = {'examples': serialized_tf_example}
     return tfma.export.EvalInputReceiver(
         features=transformed_features,
@@ -478,14 +462,15 @@ def eval_input_receiver_fn(tf_transform_dir, schema, target):
         labels=transformed_features[target])
 
 
-tf.logging.set_verbosity(tf.logging.INFO)
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.INFO)
 
 hidden_layer_size = [int(x.strip()) for x in HIDDEN_LAYER_SIZE.split(',')]
-schema = json.loads(file_io.read_file_to_string(os.path.join(DATA_DIR, "taxi-cab-classification/schema.json")))
-feature_columns = None
-feature_columns = get_feature_columns(os.path.join(DATA_DIR, "transformed"))
-estimator = get_estimator(schema,
-                          os.path.join(DATA_DIR, "transformed"),
+
+transformed_data_dir = os.path.join(DATA_DIR, "transformed")
+tf_transform_output = tft.TFTransformOutput(transformed_data_dir)
+
+feature_columns = get_feature_columns()
+estimator = get_estimator(tf_transform_output,
                           "tips",
                           os.path.join(DATA_DIR, "training"),
                           hidden_layer_size,
@@ -493,23 +478,11 @@ estimator = get_estimator(schema,
                           LEARNING_RATE,
                           feature_columns)
 
-# TODO: Expose batch size.
-train_input_fn = make_training_input_fn(
-    os.path.join(DATA_DIR, "transformed"),
-    'train',
-    32,
-    "tips",
-    num_epochs=2)
-
-eval_input_fn = make_training_input_fn(
-    os.path.join(DATA_DIR, "transformed"),
-    'eval',
-    32,
-    "tips")
-serving_input_fn = make_serving_input_fn(
-    os.path.join(DATA_DIR, "transformed"),
-    schema,
-    "tips")
+train_input_fn = make_training_input_fn(tf_transform_output, os.path.join(transformed_data_dir, 'train' + '*'),
+                                        BATCH_SIZE, "tips")
+eval_input_fn = make_training_input_fn(tf_transform_output, os.path.join(transformed_data_dir, 'eval' + '*'),
+                                       BATCH_SIZE, "tips")
+serving_input_fn = make_serving_input_fn(tf_transform_output)
 
 exporter = tf.estimator.FinalExporter('export', serving_input_fn)
 train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=STEPS)
@@ -521,8 +494,7 @@ tfma.export.export_eval_savedmodel(
     estimator=estimator,
     export_dir_base=eval_model_dir,
     eval_input_receiver_fn=(
-        lambda: eval_input_receiver_fn(
-            os.path.join(DATA_DIR, "transformed"), schema, "tips")))
+        lambda: eval_input_receiver_fn(tf_transform_output, "tips")))
 
 metadata = {
     'outputs': [{
