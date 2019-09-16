@@ -1,3 +1,4 @@
+pickup_community_area,fare,trip_start_month,trip_start_hour,trip_start_day,trip_start_timestamp,pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,trip_miles,pickup_census_tract,dropoff_census_tract,payment_type,company,trip_seconds,dropoff_community_area,tips
 22,12.85,3,11,7,1393673400,41.920451512,-87.679954768,41.877406123,-87.621971652,0.0,,17031320400,Cash,Taxi Affiliation Services,720,32,0.0
 22,5.45,8,21,7,1439675100,41.920451512,-87.679954768,41.906771332,-87.681025231,1.2,,17031241300,Cash,Dispatch Taxi Affiliation,360,24,0.0
 33,0.0,5,10,4,1432118700,41.849246754,-87.624135298,41.849246754,-87.624135298,0.0,,17031841000,Cash,Northwest Management LLC,0,33,0.0
